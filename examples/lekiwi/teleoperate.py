@@ -27,8 +27,8 @@ FPS = 30
 
 def main():
     # Create the robot and teleoperator configurations
-    robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="my_lekiwi")
-    teleop_arm_config = SO100LeaderConfig(port="/dev/tty.usbmodem585A0077581", id="my_awesome_leader_arm")
+    robot_config = LeKiwiClientConfig(remote_ip="172.20.10.3", id="my_awesome_kiwi")
+    teleop_arm_config = SO100LeaderConfig(port="/dev/tty.usbmodem5B140292091", id="my_awesome_leader_arm")
     keyboard_config = KeyboardTeleopConfig(id="my_laptop_keyboard")
 
     # Initialize the robot and teleoperator
@@ -49,29 +49,45 @@ def main():
         raise ValueError("Robot or teleop is not connected!")
 
     print("Starting teleop loop...")
-    while True:
-        t0 = time.perf_counter()
+    try:
+        while True:
+            t0 = time.perf_counter()
 
-        # Get robot observation
-        observation = robot.get_observation()
+            # Get robot observation
+            observation = robot.get_observation()
 
-        # Get teleop action
-        # Arm
-        arm_action = leader_arm.get_action()
-        arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-        # Keyboard
-        keyboard_keys = keyboard.get_action()
-        base_action = robot._from_keyboard_to_base_action(keyboard_keys)
+            # Get teleop action
+            # Arm
+            arm_action = leader_arm.get_action()
+            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+            # Keyboard
+            keyboard_keys = keyboard.get_action()
+            base_action = robot._from_keyboard_to_base_action(keyboard_keys)
 
-        action = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+            action = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
 
-        # Send action to robot
-        _ = robot.send_action(action)
+            # Send action to robot
+            _ = robot.send_action(action)
 
-        # Visualize
-        log_rerun_data(observation=observation, action=action)
+            # Visualize
+            log_rerun_data(observation=observation, action=action, compress_images=True)
 
-        precise_sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
+            precise_sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
+    except KeyboardInterrupt:
+        print("\nStopping teleop...")
+    finally:
+        # Send zero velocity to stop wheels
+        stop_action = {k: 0.0 for k in arm_action}
+        stop_action.update({"base_left_wheel.vel": 0.0, "base_right_wheel.vel": 0.0, "base_back_wheel.vel": 0.0})
+        try:
+            robot.send_action(stop_action)
+            time.sleep(0.1)
+        except Exception:
+            pass
+        robot.disconnect()
+        leader_arm.disconnect()
+        keyboard.disconnect()
+        print("Teleop stopped cleanly.")
 
 
 if __name__ == "__main__":

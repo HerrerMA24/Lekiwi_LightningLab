@@ -1,0 +1,408 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  LeKiwi Workshop - EC2 with DCV + Client VPN for Pi connectivity.
+  No GPU required (ACT inference runs on CPU).
+  Security: No open SGs, encrypted EBS, SSM access, IMDSv2.
+
+Parameters:
+  ServerCertificateArn:
+    Type: String
+    Description: ACM ARN of the server certificate for Client VPN
+    AllowedPattern: arn:aws:acm:.*
+    ConstraintDescription: Must be a valid ACM certificate ARN
+  ClientCertificateArn:
+    Type: String
+    Description: ACM ARN of the client root CA certificate for Client VPN
+    AllowedPattern: arn:aws:acm:.*
+    ConstraintDescription: Must be a valid ACM certificate ARN
+  InstanceType:
+    Type: String
+    Default: m7i.2xlarge
+    AllowedValues:
+      - c7i.2xlarge    # 8 vCPU, 16GB — compute optimized
+      - m7i.2xlarge    # 8 vCPU, 32GB — general purpose (recommended)
+      - m7i.4xlarge    # 16 vCPU, 64GB — if you want headroom
+    Description: >
+      EC2 instance type. No GPU needed — ACT runs on CPU.
+      m7i.2xlarge is comparable to M3 Pro MacBook.
+
+Resources:
+  # ─── VPC ───────────────────────────────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-vpc
+
+  # ─── Private Subnet (EC2 lives here, no public IP) ─────────────────────
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-private
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-private-rt
+
+  PrivateSubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ─── NAT Gateway (EC2 needs outbound for package installs) ─────────────
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.100.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-public
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NATElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATElasticIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-nat
+
+  PrivateRouteToNAT:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # ─── Security Groups (NO 0.0.0.0/0 ingress) ────────────────────────────
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 - only VPN clients can reach it
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # DCV from VPN clients only
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 10.0.200.0/22
+          Description: DCV from VPN clients
+        # All traffic from VPN clients (Pi ZeroMQ, SSH relay)
+        - IpProtocol: -1
+          CidrIp: 10.0.200.0/22
+          Description: All traffic from VPN-connected devices
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound (packages, model downloads)
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-ec2-sg
+
+  VPNSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Client VPN endpoint
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 10.0.0.0/16
+          Description: Traffic to VPC
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-vpn-sg
+
+  # ─── VPC Endpoints for SSM ─────────────────────────────────────────────
+  VPCEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC Endpoints - HTTPS from VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-vpce-sg
+
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnet]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+      PrivateDnsEnabled: true
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnet]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+      PrivateDnsEnabled: true
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnet]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+      PrivateDnsEnabled: true
+
+  # ─── Client VPN ────────────────────────────────────────────────────────
+  VPNLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vpn/lekiwi-workshop
+      RetentionInDays: 7
+
+  ClientVPNEndpoint:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Properties:
+      Description: LeKiwi Workshop - connects Pi and EC2
+      ClientCidrBlock: 10.0.200.0/22
+      ServerCertificateArn: !Ref ServerCertificateArn
+      AuthenticationOptions:
+        - Type: certificate-authentication
+          MutualAuthentication:
+            ClientRootCertificateChainArn: !Ref ClientCertificateArn
+      ConnectionLogOptions:
+        Enabled: true
+        CloudwatchLogGroup: !Ref VPNLogGroup
+      VpcId: !Ref VPC
+      SecurityGroupIds: [!Ref VPNSecurityGroup]
+      SplitTunnel: true
+      TransportProtocol: udp
+      TagSpecifications:
+        - ResourceType: client-vpn-endpoint
+          Tags:
+            - Key: Name
+              Value: lekiwi-workshop-vpn
+
+  ClientVPNSubnetAssoc:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVPNEndpoint
+      SubnetId: !Ref PrivateSubnet
+
+  ClientVPNAuthRule:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVPNEndpoint
+      TargetNetworkCidr: 10.0.0.0/16
+      AuthorizeAllGroups: true
+      Description: Allow VPN clients to access VPC
+
+  # ─── IAM Role ──────────────────────────────────────────────────────────
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub lekiwi-workshop-ec2-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DCVLicense
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::dcv-license.${AWS::Region}/*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  # ─── EC2 Instance ──────────────────────────────────────────────────────
+  WorkshopInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: [!Ref EC2SecurityGroup]
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Encrypted: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+          # Install DCV
+          wget -q https://d1uj6qtbmh3dt5.cloudfront.net/NICE-GPG-KEY
+          gpg --import NICE-GPG-KEY
+          wget -q https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-ubuntu2204-x86_64.tgz
+          tar -xzf nice-dcv-ubuntu2204-x86_64.tgz
+          cd nice-dcv-*/
+          apt-get install -y ./nice-dcv-server_*.deb ./nice-dcv-web-viewer_*.deb
+          systemctl enable dcvserver
+          systemctl start dcvserver
+          cd /
+
+          # Set password for DCV login
+          echo "ubuntu:WorkshopSecure2025!" | chpasswd
+
+          # Auto-create DCV session on boot
+          cat > /etc/systemd/system/dcv-session.service << 'EOF'
+          [Unit]
+          Description=DCV Virtual Session
+          After=dcvserver.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/dcv create-session --type=virtual --owner ubuntu workshop
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl enable dcv-session
+          systemctl start dcv-session
+
+          # Install Python 3.11 + dev tools
+          apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip git
+
+          # Clone workshop repo and set up environment
+          su - ubuntu -c '
+            git clone https://github.com/wgomez9/SNOW.git /home/ubuntu/lerobot
+            cd /home/ubuntu/lerobot
+            python3.11 -m venv .venv
+            source .venv/bin/activate
+            pip install -e ".[lekiwi]"
+            pip install pynput rerun-sdk
+          '
+
+          echo "Setup complete" > /tmp/setup-done
+      Tags:
+        - Key: Name
+          Value: lekiwi-workshop-ec2
+
+Mappings:
+  RegionAMI:
+    us-east-1:
+      AMI: ami-0c7217cdde317cfec  # Ubuntu 22.04 LTS x86_64
+    us-west-2:
+      AMI: ami-03f65b8614a860c29  # Ubuntu 22.04 LTS x86_64
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID (connect via SSM)
+    Value: !Ref WorkshopInstance
+
+  SSMCommand:
+    Description: Connect to instance
+    Value: !Sub "aws ssm start-session --target ${WorkshopInstance} --profile lightning-lab"
+
+  PrivateIP:
+    Description: Instance private IP (for DCV access via VPN)
+    Value: !GetAtt WorkshopInstance.PrivateIpAddress
+
+  DCVAccess:
+    Description: DCV URL (accessible only via VPN)
+    Value: !Sub "https://${WorkshopInstance.PrivateIpAddress}:8443 (connect to VPN first)"
+
+  DCVCredentials:
+    Description: DCV login
+    Value: "Username: ubuntu / Password: WorkshopSecure2025!"
+
+  ClientVPNEndpointId:
+    Description: Client VPN Endpoint ID
+    Value: !Ref ClientVPNEndpoint
+
+  ExportVPNConfig:
+    Description: Export VPN config command
+    Value: !Sub >
+      aws ec2 export-client-vpn-client-configuration
+      --client-vpn-endpoint-id ${ClientVPNEndpoint}
+      --output text > lekiwi.ovpn
+
+  HowItWorks:
+    Description: Workshop flow
+    Value: >
+      1. Pi connects to Client VPN → gets IP 10.0.200.x
+      2. Customer connects to VPN → opens DCV at EC2 private IP:8443
+      3. In DCV terminal 1: SSH to Pi (10.0.200.x), run lekiwi_host
+      4. In DCV terminal 2: Run teleoperate.py with REMOTE_IP=10.0.200.x
